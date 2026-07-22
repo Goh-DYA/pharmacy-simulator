@@ -5,17 +5,22 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
-  ArrowsOutSimple,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   BookOpenText,
   Briefcase,
   Buildings,
+  ChatCircleDots,
   Eye,
-  EyeSlash,
   Info,
   List,
+  PersonSimpleWalk,
   SpeakerHigh,
   SpeakerSlash,
   Target,
@@ -27,13 +32,34 @@ import { PhaseRail } from "./components/PhaseRail.jsx";
 import { SkillMeter } from "./components/SkillMeter.jsx";
 import { SourceDrawer } from "./components/SourceDrawer.jsx";
 import {
+  DEFAULT_CAMERA_PRESET,
+  getCameraPreset,
+  getNextCameraPreset,
+} from "./game/camera.js";
+import {
   calculateOutcome,
   getPhaseProgress,
   getTrainingCase,
   TRAINING_CASES,
 } from "./game/scenarios.js";
+import {
+  SCENE_CONTROL_EVENT,
+  getPatientSpeechDuration,
+  shouldIgnoreMovementInput,
+} from "./game/movement.js";
+import {
+  getPatientVoiceProfile,
+  getPlayerVoiceProfile,
+  selectSpeechVoice,
+} from "./game/voices.js";
 
 const INITIAL_SCORES = { rapport: 0, safety: 0, reasoning: 0 };
+const INITIAL_WORLD_STATE = {
+  canInteract: false,
+  distance: 2.8,
+  isAutoWalking: false,
+  isMoving: false,
+};
 const PharmacyScene = lazy(() =>
   import("./game/PharmacyScene.jsx").then((module) => ({
     default: module.PharmacyScene,
@@ -50,11 +76,18 @@ class SceneErrorBoundary extends Component {
     return { failed: true };
   }
 
+  componentDidCatch() {
+    this.props.onSceneFailure?.();
+  }
+
   render() {
     if (this.state.failed) {
       return (
         <div className="world-fallback" role="img" aria-label="Community pharmacy interior">
-          <img src="/assets/patient-daniel.png" alt="Daniel waiting at the consultation counter" />
+          <img
+            src={this.props.patientAvatar}
+            alt={`${this.props.patientName} waiting at the consultation counter`}
+          />
           <p>3D view unavailable. The training interface remains playable.</p>
         </div>
       );
@@ -140,6 +173,223 @@ function getFreeformPatientReply(trainingCase, question) {
   return `${patientName}: I’m not sure how to answer that yet. Could you make the question more specific?`;
 }
 
+function dispatchSceneControl(action, active = true) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent(SCENE_CONTROL_EVENT, { detail: { action, active } }),
+  );
+}
+
+function useCharacterSpeech({
+  cue,
+  enabled,
+  line,
+  onComplete,
+  pitch = 1,
+  rate = 0.96,
+  soundOn,
+  speakerPrefix = "",
+  voiceProfile,
+}) {
+  const [isSpeaking, setSpeaking] = useState(false);
+  const utteranceRef = useRef(null);
+  const playedCueRef = useRef(null);
+  const soundOnRef = useRef(soundOn);
+  const onCompleteRef = useRef(onComplete);
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
+
+  useEffect(() => {
+    soundOnRef.current = soundOn;
+    if (!soundOn && utteranceRef.current) {
+      window.speechSynthesis?.cancel();
+      utteranceRef.current = null;
+    }
+  }, [soundOn]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const speech = window.speechSynthesis;
+    const spokenLine = speakerPrefix && line.startsWith(speakerPrefix)
+      ? line.slice(speakerPrefix.length).trim()
+      : line.trim();
+
+    if (!enabled || !spokenLine) {
+      if (utteranceRef.current) {
+        speech?.cancel();
+        utteranceRef.current = null;
+      }
+      setSpeaking(false);
+      return undefined;
+    }
+
+    if (playedCueRef.current === cue) {
+      setSpeaking(false);
+      return undefined;
+    }
+    playedCueRef.current = cue;
+
+    let finished = false;
+    let handleVoicesChanged = null;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      utteranceRef.current = null;
+      setSpeaking(false);
+      onCompleteRef.current?.();
+    };
+    setSpeaking(true);
+    const fallbackTimer = window.setTimeout(
+      finish,
+      getPatientSpeechDuration(spokenLine),
+    );
+
+    if (soundOnRef.current && speech && window.SpeechSynthesisUtterance) {
+      speech.cancel();
+      const speakWithAvailableVoices = () => {
+        if (finished) return;
+        const voices = speech.getVoices();
+        if (!voices.length) return;
+
+        const utterance = new window.SpeechSynthesisUtterance(spokenLine);
+        utterance.voice = selectSpeechVoice(voices, voiceProfile);
+        utterance.rate = rate;
+        utterance.pitch = pitch;
+        utterance.volume = 0.86;
+        utterance.onend = finish;
+        utterance.onerror = finish;
+        utteranceRef.current = utterance;
+        speech.speak(utterance);
+      };
+
+      if (speech.getVoices().length) {
+        speakWithAvailableVoices();
+      } else {
+        handleVoicesChanged = speakWithAvailableVoices;
+        speech.addEventListener?.("voiceschanged", handleVoicesChanged, {
+          once: true,
+        });
+      }
+    }
+
+    return () => {
+      finished = true;
+      window.clearTimeout(fallbackTimer);
+      if (handleVoicesChanged) {
+        speech?.removeEventListener?.("voiceschanged", handleVoicesChanged);
+      }
+      if (utteranceRef.current) {
+        speech?.cancel();
+        utteranceRef.current = null;
+      }
+    };
+  }, [cue, enabled, line, pitch, rate, speakerPrefix, voiceProfile]);
+
+  return isSpeaking;
+}
+
+function InteractionPrompt({ buttonRef, onActivate, patientName, worldState }) {
+  const isReady = worldState.canInteract || Boolean(onActivate);
+  const actionLabel = isReady
+    ? `Talk to ${patientName}`
+    : worldState.isAutoWalking
+      ? `Walking to ${patientName}`
+      : worldState.isMoving
+        ? "Exploring the pharmacy"
+      : `Approach ${patientName}`;
+
+  return (
+    <aside
+      id="simulation-action"
+      className={`interaction-prompt ${isReady ? "interaction-prompt--ready" : ""}`}
+      aria-label="Patient interaction"
+      tabIndex={-1}
+    >
+      <span className="interaction-prompt__icon" aria-hidden="true">
+        {isReady ? (
+          <ChatCircleDots weight="fill" />
+        ) : (
+          <PersonSimpleWalk weight="fill" />
+        )}
+      </span>
+      <span className="interaction-prompt__copy">
+        <small>
+          {isReady
+            ? onActivate
+              ? "3D view unavailable · dialogue remains playable"
+              : "Patient in range"
+            : `${worldState.distance.toFixed(1)} m to consultation point`}
+        </small>
+        <strong>{actionLabel}</strong>
+      </span>
+      <button
+        ref={buttonRef}
+        type="button"
+        onClick={() =>
+          onActivate ? onActivate() : dispatchSceneControl("interact")
+        }
+        aria-label={
+          isReady
+            ? `Start conversation with ${patientName}`
+            : `Walk to ${patientName}`
+        }
+      >
+        <kbd>{isReady ? "E" : "GO"}</kbd>
+        <span>{isReady ? "Start" : "Auto-walk"}</span>
+      </button>
+    </aside>
+  );
+}
+
+function MovementPad() {
+  function hold(action) {
+    return {
+      onBlur: () => dispatchSceneControl(action, false),
+      onKeyDown: (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          dispatchSceneControl(action, true);
+        }
+      },
+      onKeyUp: (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          dispatchSceneControl(action, false);
+        }
+      },
+      onPointerCancel: () => dispatchSceneControl(action, false),
+      onPointerDown: (event) => {
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+        dispatchSceneControl(action, true);
+      },
+      onPointerLeave: () => dispatchSceneControl(action, false),
+      onPointerUp: () => dispatchSceneControl(action, false),
+    };
+  }
+
+  return (
+    <div className="movement-pad" role="group" aria-label="Movement controls">
+      <button className="movement-pad__up" type="button" aria-label="Move forward" {...hold("forward")}>
+        <ArrowUp weight="bold" />
+      </button>
+      <button className="movement-pad__left" type="button" aria-label="Move left" {...hold("left")}>
+        <ArrowLeft weight="bold" />
+      </button>
+      <button className="movement-pad__talk" type="button" aria-label="Approach patient" onClick={() => dispatchSceneControl("interact")}>
+        <ChatCircleDots weight="fill" />
+      </button>
+      <button className="movement-pad__right" type="button" aria-label="Move right" {...hold("right")}>
+        <ArrowRight weight="bold" />
+      </button>
+      <button className="movement-pad__down" type="button" aria-label="Move backward" {...hold("backward")}>
+        <ArrowDown weight="bold" />
+      </button>
+    </div>
+  );
+}
+
 function BrandMark() {
   return (
     <div className="brand-mark" aria-label="PharmaCity Academy">
@@ -167,17 +417,61 @@ export function App() {
   const [isSourceDrawerOpen, setSourceDrawerOpen] = useState(false);
   const [isDebriefOpen, setDebriefOpen] = useState(false);
   const [isSoundOn, setSoundOn] = useState(true);
-  const [focusMode, setFocusMode] = useState(true);
+  const [cameraPreset, setCameraPreset] = useState(DEFAULT_CAMERA_PRESET);
   const [patientPulse, setPatientPulse] = useState(false);
+  const [isConsulting, setConsulting] = useState(false);
+  const [pendingTurn, setPendingTurn] = useState(null);
+  const [sceneResetKey, setSceneResetKey] = useState(0);
+  const [worldState, setWorldState] = useState(INITIAL_WORLD_STATE);
+  const [sceneFailed, setSceneFailed] = useState(false);
+  const dialogueShellRef = useRef(null);
+  const interactionButtonRef = useRef(null);
+  const patientPulseTimerRef = useRef(null);
+  const wasConsultingRef = useRef(false);
 
   const trainingCase = useMemo(
     () => getTrainingCase(activeCaseId),
     [activeCaseId],
   );
+  const cameraView = getCameraPreset(cameraPreset);
+  const nextCameraPreset = getNextCameraPreset(cameraPreset);
+  const nextCameraView = getCameraPreset(nextCameraPreset);
   const turn = trainingCase.turns[turnIndex];
   const phases = getPhaseProgress(trainingCase, turnIndex);
   const progress = Math.round(((turnIndex + 1) / trainingCase.turns.length) * 100);
   const outcome = calculateOutcome(scores, criticalErrors);
+  const activePatientLine =
+    selectedChoice?.response || freeformReply || turn.patientLine;
+  const patientReaction = selectedChoice
+    ? selectedChoice.correct
+      ? "positive"
+      : "negative"
+    : "neutral";
+  const patientSpeechCue = `${activeCaseId}:${turnIndex}:${selectedChoice?.id ?? "opening"}:${freeformReply}`;
+  const controlsEnabled = !(
+    isCaseDrawerOpen ||
+    isSourceDrawerOpen ||
+    isDebriefOpen
+  );
+  const patientPitch =
+    activeCaseId === "raj-prescription"
+      ? 0.88
+      : activeCaseId === "mei-lin-antibiotic"
+        ? 1.06
+        : 0.98;
+  const patientVoiceProfile = useMemo(
+    () => getPatientVoiceProfile(trainingCase.patientGender),
+    [trainingCase.patientGender],
+  );
+  const isPatientSpeaking = useCharacterSpeech({
+    cue: patientSpeechCue,
+    enabled: isConsulting && controlsEnabled,
+    line: activePatientLine,
+    pitch: patientPitch,
+    soundOn: isSoundOn,
+    speakerPrefix: `${trainingCase.patientName}:`,
+    voiceProfile: patientVoiceProfile,
+  });
 
   const resetCase = useCallback((caseId = activeCaseId) => {
     setActiveCaseId(caseId);
@@ -188,12 +482,16 @@ export function App() {
     setHistory([]);
     setFacts([]);
     setFreeformReply("");
+    setPendingTurn(null);
+    setCameraPreset(DEFAULT_CAMERA_PRESET);
     setDebriefOpen(false);
+    setConsulting(false);
+    setWorldState(INITIAL_WORLD_STATE);
+    setSceneResetKey((current) => current + 1);
   }, [activeCaseId]);
 
-  const chooseResponse = useCallback(
+  const applyChoice = useCallback(
     (choice) => {
-      if (selectedChoice) return;
       setSelectedChoice(choice);
       setFreeformReply("");
       setScores((current) => ({
@@ -217,11 +515,50 @@ export function App() {
       ]);
       playInterfaceTone(isSoundOn, choice.correct ? 540 : 260);
     },
-    [isSoundOn, selectedChoice, turn.phase, turnIndex],
+    [isSoundOn, turn.phase, turnIndex],
   );
 
+  const chooseResponse = useCallback(
+    (choice) => {
+      if (selectedChoice || pendingTurn || isPatientSpeaking) return;
+      setPendingTurn({
+        id: `choice:${choice.id}`,
+        kind: "choice",
+        line: choice.label,
+        choice,
+      });
+      playInterfaceTone(isSoundOn, 430);
+    },
+    [isPatientSpeaking, isSoundOn, pendingTurn, selectedChoice],
+  );
+
+  const handlePlayerSpeechComplete = useCallback(() => {
+    if (!pendingTurn) return;
+    if (pendingTurn.kind === "choice") {
+      applyChoice(pendingTurn.choice);
+    } else {
+      setSelectedChoice(null);
+      setFreeformReply(pendingTurn.reply);
+      playInterfaceTone(isSoundOn, 460);
+    }
+    setPendingTurn(null);
+  }, [applyChoice, isSoundOn, pendingTurn]);
+
+  const isPlayerSpeaking = useCharacterSpeech({
+    cue: pendingTurn
+      ? `${activeCaseId}:${turnIndex}:${pendingTurn.id}`
+      : "",
+    enabled: Boolean(pendingTurn) && isConsulting,
+    line: pendingTurn?.line ?? "",
+    onComplete: handlePlayerSpeechComplete,
+    pitch: 0.92,
+    rate: 1.02,
+    soundOn: isSoundOn && controlsEnabled,
+    voiceProfile: getPlayerVoiceProfile(),
+  });
+
   const continueCase = useCallback(() => {
-    if (!selectedChoice) return;
+    if (!selectedChoice || isPatientSpeaking || isPlayerSpeaking) return;
     playInterfaceTone(isSoundOn, 620);
     if (turnIndex >= trainingCase.turns.length - 1) {
       setDebriefOpen(true);
@@ -230,16 +567,92 @@ export function App() {
     setTurnIndex((current) => current + 1);
     setSelectedChoice(null);
     setFreeformReply("");
-  }, [isSoundOn, selectedChoice, trainingCase.turns.length, turnIndex]);
+  }, [
+    isPatientSpeaking,
+    isPlayerSpeaking,
+    isSoundOn,
+    selectedChoice,
+    trainingCase.turns.length,
+    turnIndex,
+  ]);
+
+  const handleConsultationChange = useCallback(
+    (nextState) => {
+      if (isConsulting === nextState) return;
+      playInterfaceTone(isSoundOn, nextState ? 520 : 320);
+      if (!nextState) setPendingTurn(null);
+      setConsulting(nextState);
+    },
+    [isConsulting, isSoundOn],
+  );
+
+  const handleWorldState = useCallback((nextState) => {
+    setWorldState((current) => {
+      if (
+        current.canInteract === nextState.canInteract &&
+        current.distance === nextState.distance &&
+        current.isAutoWalking === nextState.isAutoWalking &&
+        current.isMoving === nextState.isMoving
+      ) {
+        return current;
+      }
+      return nextState;
+    });
+  }, []);
+
+  const handleSceneFailure = useCallback(() => {
+    setSceneFailed(true);
+    setConsulting(true);
+  }, []);
+
+  const cycleCameraView = useCallback(() => {
+    setCameraPreset((current) => getNextCameraPreset(current));
+  }, []);
+
+  useEffect(() => {
+    const shouldRestorePrompt = wasConsultingRef.current && !isConsulting;
+    wasConsultingRef.current = isConsulting;
+    const frame = window.requestAnimationFrame(() => {
+      if (isConsulting) {
+        dialogueShellRef.current?.focus({ preventScroll: true });
+      } else if (shouldRestorePrompt) {
+        interactionButtonRef.current?.focus({ preventScroll: true });
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isConsulting]);
 
   useEffect(() => {
     function handleKeyDown(event) {
       if (isCaseDrawerOpen || isSourceDrawerOpen || isDebriefOpen) return;
-      if (!selectedChoice && ["1", "2", "3"].includes(event.key)) {
+      if (
+        event.key.toLowerCase() === "v" &&
+        !sceneFailed &&
+        !shouldIgnoreMovementInput(event.target)
+      ) {
+        event.preventDefault();
+        cycleCameraView();
+        return;
+      }
+      if (!isConsulting || shouldIgnoreMovementInput(event.target)) return;
+      if (
+        !selectedChoice &&
+        !pendingTurn &&
+        !isPatientSpeaking &&
+        ["1", "2", "3"].includes(event.key)
+      ) {
         const choice = turn.choices[Number(event.key) - 1];
         if (choice) chooseResponse(choice);
       }
-      if (selectedChoice && event.key === "Enter") continueCase();
+      if (
+        selectedChoice &&
+        !isPatientSpeaking &&
+        !isPlayerSpeaking &&
+        event.key === "Enter"
+      ) {
+        event.preventDefault();
+        continueCase();
+      }
     }
 
     window.addEventListener("keydown", handleKeyDown);
@@ -247,22 +660,49 @@ export function App() {
   }, [
     chooseResponse,
     continueCase,
+    cycleCameraView,
     isCaseDrawerOpen,
     isDebriefOpen,
+    isConsulting,
+    isPatientSpeaking,
+    isPlayerSpeaking,
     isSourceDrawerOpen,
+    pendingTurn,
+    sceneFailed,
     selectedChoice,
     turn.choices,
   ]);
 
-  function handlePatientFocus() {
+  const handlePatientFocus = useCallback((mode = "engaged") => {
     setPatientPulse(true);
-    playInterfaceTone(isSoundOn, 480);
-    window.setTimeout(() => setPatientPulse(false), 620);
-  }
+    playInterfaceTone(isSoundOn, mode === "engaged" ? 480 : 410);
+    if (patientPulseTimerRef.current) {
+      window.clearTimeout(patientPulseTimerRef.current);
+    }
+    patientPulseTimerRef.current = window.setTimeout(
+      () => setPatientPulse(false),
+      720,
+    );
+  }, [isSoundOn]);
+
+  useEffect(
+    () => () => {
+      if (patientPulseTimerRef.current) {
+        window.clearTimeout(patientPulseTimerRef.current);
+      }
+    },
+    [],
+  );
 
   function handleAskQuestion(question) {
-    setFreeformReply(getFreeformPatientReply(trainingCase, question));
-    playInterfaceTone(isSoundOn, 460);
+    if (selectedChoice || pendingTurn || isPatientSpeaking) return;
+    setPendingTurn({
+      id: `question:${Date.now()}`,
+      kind: "question",
+      line: question,
+      reply: getFreeformPatientReply(trainingCase, question),
+    });
+    playInterfaceTone(isSoundOn, 430);
   }
 
   function handleCaseSelect(caseId) {
@@ -272,11 +712,15 @@ export function App() {
 
   return (
     <main className="simulator-shell">
-      <a className="skip-link" href="#dialogue-panel">
-        Skip to dialogue
+      <a className="skip-link" href="#simulation-action">
+        Skip to primary action
       </a>
 
-      <SceneErrorBoundary>
+      <SceneErrorBoundary
+        onSceneFailure={handleSceneFailure}
+        patientAvatar={trainingCase.avatar}
+        patientName={trainingCase.patientName}
+      >
         <Suspense
           fallback={
             <div className="scene-loading" role="status">
@@ -285,9 +729,18 @@ export function App() {
           }
         >
           <PharmacyScene
-            focusMode={focusMode}
+            cameraPreset={cameraPreset}
             patientAvatar={trainingCase.avatar}
+            patientName={trainingCase.patientName}
+            patientSpeaking={isPatientSpeaking}
+            playerSpeaking={isPlayerSpeaking}
+            patientReaction={patientReaction}
+            consulting={isConsulting}
+            controlsEnabled={controlsEnabled}
+            resetKey={sceneResetKey}
+            onConsultationChange={handleConsultationChange}
             onPatientFocus={handlePatientFocus}
+            onWorldState={handleWorldState}
           />
         </Suspense>
       </SceneErrorBoundary>
@@ -330,14 +783,30 @@ export function App() {
       <div className="objective-pill" role="status">
         <Target weight="fill" />
         <span>
-          <small>Current objective</small>
-          <strong>{turn.objective}</strong>
+          <small>{isConsulting ? "Current objective" : "Navigation"}</small>
+          <strong>
+            {isConsulting
+              ? turn.objective
+              : sceneFailed
+                ? `Open the conversation with ${trainingCase.patientName}`
+                : `Approach ${trainingCase.patientName} to begin`}
+          </strong>
         </span>
       </div>
 
       <div className={`patient-focus-hint ${patientPulse ? "patient-focus-hint--pulse" : ""}`}>
         <span>{trainingCase.patientName}</span>
-        <small>Click the patient to refocus</small>
+        <small>
+          {isConsulting
+            ? isPlayerSpeaking
+              ? "Pharmacist speaking"
+              : isPatientSpeaking
+                ? "Patient speaking"
+                : "Conversation focused"
+            : worldState.isMoving
+              ? "Walking through the consultation bay"
+              : "Waiting at the consultation counter"}
+        </small>
       </div>
 
       <SkillMeter scores={scores} />
@@ -355,38 +824,88 @@ export function App() {
         </aside>
       ) : null}
 
-      <button
-        className="world-control"
-        type="button"
-        onClick={() => setFocusMode((current) => !current)}
-        aria-pressed={!focusMode}
-      >
-        {focusMode ? <Eye /> : <EyeSlash />}
-        <span>{focusMode ? "Widen view" : "Focus consultation"}</span>
-        <ArrowsOutSimple />
-      </button>
+      {sceneFailed ? null : (
+        <button
+          className="world-control"
+          type="button"
+          onClick={cycleCameraView}
+          aria-label={`Camera view: ${cameraView.label}. Activate to switch to ${nextCameraView.label} view`}
+          title="Change camera angle (V)"
+          data-camera-preset={cameraPreset}
+        >
+          <Eye weight="bold" />
+          <span>{cameraView.label} view</span>
+          <kbd>V</kbd>
+          <ArrowRight weight="bold" />
+        </button>
+      )}
 
-      <div id="dialogue-panel" className={patientPulse ? "dialogue-pulse" : ""}>
-        <DialoguePanel
-          key={`${activeCaseId}-${turnIndex}`}
-          patientName={trainingCase.patientName}
-          turn={turn}
-          selectedChoice={selectedChoice}
-          onChoose={chooseResponse}
-          onContinue={continueCase}
-          onAskQuestion={handleAskQuestion}
-          freeformReply={freeformReply}
-        />
-      </div>
+      {isConsulting ? (
+        <div
+          id="simulation-action"
+          className={`dialogue-panel-shell ${patientPulse ? "dialogue-pulse" : ""}`}
+          ref={dialogueShellRef}
+          tabIndex={-1}
+        >
+          <DialoguePanel
+            key={`${activeCaseId}-${turnIndex}`}
+            patientName={trainingCase.patientName}
+            turn={turn}
+            selectedChoice={selectedChoice}
+            onChoose={chooseResponse}
+            onContinue={continueCase}
+            onAskQuestion={handleAskQuestion}
+            freeformReply={freeformReply}
+            isSpeaking={isPatientSpeaking}
+            interactionLocked={
+              isPatientSpeaking || isPlayerSpeaking || Boolean(pendingTurn)
+            }
+            patientReaction={patientReaction}
+            playerLine={pendingTurn?.line ?? ""}
+            playerSpeaking={isPlayerSpeaking}
+            onLeave={() => handleConsultationChange(false)}
+          />
+        </div>
+      ) : (
+        <>
+          <InteractionPrompt
+            buttonRef={interactionButtonRef}
+            onActivate={
+              sceneFailed ? () => handleConsultationChange(true) : undefined
+            }
+            patientName={trainingCase.patientName}
+            worldState={worldState}
+          />
+          {sceneFailed ? null : <MovementPad />}
+        </>
+      )}
 
       <div className="input-hints" aria-hidden="true">
-        <span>
-          <kbd>1–3</kbd> choose
-        </span>
-        <span>
-          <kbd>Enter</kbd> continue
-        </span>
-        <span>Move pointer to look</span>
+        {isConsulting ? (
+          <>
+            <span>
+              <kbd>1–3</kbd> choose
+            </span>
+            <span>
+              <kbd>Enter</kbd> continue
+            </span>
+            <span>
+              <kbd>Esc</kbd> step away
+            </span>
+          </>
+        ) : (
+          <>
+            <span>
+              <kbd>WASD</kbd> move
+            </span>
+            <span>
+              <kbd>Shift</kbd> brisk walk
+            </span>
+            <span>
+              Click floor to walk · <kbd>E</kbd> talk
+            </span>
+          </>
+        )}
       </div>
 
       <div className="prototype-note">

@@ -4,6 +4,7 @@ export const TRAINING_CASES = [
   {
     id: "daniel-sore-throat",
     patientName: "Daniel",
+    patientGender: "male",
     avatar: "/assets/patient-daniel.png",
     title: "Fever and sore throat",
     caseType: "Minor ailment",
@@ -226,6 +227,7 @@ export const TRAINING_CASES = [
   {
     id: "mei-lin-antibiotic",
     patientName: "Mei Lin",
+    patientGender: "female",
     avatar: "/assets/patient-mei-lin.png",
     title: "The strongest antibiotic",
     caseType: "Demanding customer",
@@ -401,6 +403,7 @@ export const TRAINING_CASES = [
   {
     id: "raj-prescription",
     patientName: "Mr Raj",
+    patientGender: "male",
     avatar: "/assets/patient-mr-raj.png",
     title: "The unsigned prescription",
     caseType: "Prescription supply",

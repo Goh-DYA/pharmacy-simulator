@@ -1,14 +1,21 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ArrowRight,
   ChatCircleDots,
   CheckCircle,
   PencilSimple,
   WarningCircle,
+  X,
 } from "@phosphor-icons/react";
 
-function ChoiceFeedback({ choice, onContinue }) {
+function ChoiceFeedback({ choice, disabled, onContinue }) {
   const isStrong = choice.correct;
+  const continueButtonRef = useRef(null);
+
+  useEffect(() => {
+    if (!disabled) continueButtonRef.current?.focus({ preventScroll: true });
+  }, [disabled]);
+
   return (
     <div
       className={`choice-feedback ${isStrong ? "choice-feedback--strong" : "choice-feedback--review"}`}
@@ -23,8 +30,13 @@ function ChoiceFeedback({ choice, onContinue }) {
         <strong>{isStrong ? "Sound decision" : "Pause and review"}</strong>
         <p>{choice.feedback}</p>
       </div>
-      <button type="button" onClick={onContinue} autoFocus>
-        Continue
+      <button
+        ref={continueButtonRef}
+        type="button"
+        onClick={onContinue}
+        disabled={disabled}
+      >
+        {disabled ? "Listening…" : "Continue"}
         <ArrowRight weight="bold" />
       </button>
     </div>
@@ -39,29 +51,75 @@ export function DialoguePanel({
   onContinue,
   onAskQuestion,
   freeformReply,
+  isSpeaking = false,
+  interactionLocked = false,
+  patientReaction = "neutral",
+  playerLine = "",
+  playerSpeaking = false,
+  onLeave,
 }) {
   const [customQuestion, setCustomQuestion] = useState("");
 
   function submitQuestion(event) {
     event.preventDefault();
     const question = customQuestion.trim();
-    if (!question) return;
+    if (!question || interactionLocked) return;
     onAskQuestion(question);
     setCustomQuestion("");
   }
 
+  const activeSpeaker = playerSpeaking ? "You" : patientName;
+  const activeRole = playerSpeaking ? "Pharmacist" : "Patient";
+  const patientState =
+    playerSpeaking || isSpeaking
+      ? "Speaking"
+      : patientReaction === "positive"
+        ? "Reassured"
+        : patientReaction === "negative"
+          ? "Concerned"
+          : "Listening";
+
   return (
-    <section className="dialogue-panel" aria-label={`Conversation with ${patientName}`}>
-      <div className="dialogue-panel__speaker">
-        <span>{patientName}</span>
-        <small>Patient</small>
+    <section
+      className={`dialogue-panel ${isSpeaking || playerSpeaking ? "dialogue-panel--speaking" : ""} ${playerSpeaking ? "dialogue-panel--player-speaking" : ""}`}
+      aria-label={`Conversation with ${patientName}`}
+    >
+      <div className="dialogue-panel__heading">
+        <div className="dialogue-panel__speaker">
+          <span>{activeSpeaker}</span>
+          <small>{activeRole}</small>
+          <span
+            className={`dialogue-panel__speech-state dialogue-panel__speech-state--${patientReaction}`}
+            aria-hidden="true"
+          >
+            <i />
+            <i />
+            <i />
+            {patientState}
+          </span>
+        </div>
+        <button
+          className="dialogue-panel__leave"
+          type="button"
+          onClick={onLeave}
+          aria-label="Step away from the conversation"
+          title="Step away (Esc)"
+        >
+          <X weight="bold" />
+        </button>
       </div>
       <p className="dialogue-panel__line" aria-live="polite">
-        {selectedChoice?.response || freeformReply || turn.patientLine}
+        {playerSpeaking
+          ? playerLine
+          : selectedChoice?.response || freeformReply || turn.patientLine}
       </p>
 
       {selectedChoice ? (
-        <ChoiceFeedback choice={selectedChoice} onContinue={onContinue} />
+        <ChoiceFeedback
+          choice={selectedChoice}
+          disabled={interactionLocked}
+          onContinue={onContinue}
+        />
       ) : (
         <div className="dialogue-panel__choices">
           {turn.choices.map((choice, index) => (
@@ -70,6 +128,7 @@ export function DialoguePanel({
               key={choice.id}
               type="button"
               onClick={() => onChoose(choice)}
+              disabled={interactionLocked}
             >
               <span className="dialogue-choice__shortcut" aria-hidden="true">
                 {index + 1}
@@ -91,8 +150,12 @@ export function DialoguePanel({
               value={customQuestion}
               placeholder="Ask your own question…"
               onChange={(event) => setCustomQuestion(event.target.value)}
+              disabled={interactionLocked}
             />
-            <button type="submit" disabled={!customQuestion.trim()}>
+            <button
+              type="submit"
+              disabled={!customQuestion.trim() || interactionLocked}
+            >
               Ask
             </button>
           </form>
